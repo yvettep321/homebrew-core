@@ -1,0 +1,137 @@
+name: Recreate macOS self-hosted runners on schedule
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Once each 24 hours, at 1 during the night
+    - cron: "0 1 * * *"
+
+concurrency:
+  group: recreate-macos-runners
+  cancel-in-progress: true
+
+jobs:
+  recreate:
+    if: github.repository == 'Homebrew/homebrew-core'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner_name: monterey-1
+            label: 12
+            vm_name: monterey
+            node: macpro-4
+            port: 8822
+          - runner_name: monterey-2
+            label: 12
+            vm_name: monterey
+            node: macpro-4
+            port: 8823
+          - runner_name: monterey-3
+            label: 12
+            vm_name: monterey
+            node: macpro-4
+            port: 8824
+          - runner_name: monterey-4
+            label: 12
+            vm_name: monterey
+            node: macpro-4
+            port: 8825
+          - runner_name: bigsur-1
+            label: 11
+            vm_name: bigsur
+            node: macpro-5
+            port: 8822
+          - runner_name: bigsur-2
+            label: 11
+            vm_name: bigsur
+            node: macpro-5
+            port: 8823
+          - runner_name: bigsur-3
+            label: 11
+            vm_name: bigsur
+            node: macpro-5
+            port: 8824
+          - runner_name: bigsur-4
+            label: 11
+            vm_name: bigsur
+            node: macpro-5
+            port: 8825
+          - runner_name: catalina-1
+            label: 10.15
+            vm_name: catalina
+            node: macpro-6
+            port: 8822
+          - runner_name: catalina-2
+            label: 10.15
+            vm_name: catalina
+            node: macpro-6
+            port: 8823
+          - runner_name: catalina-3
+            label: 10.15
+            vm_name: catalina
+            node: macpro-6
+            port: 8824
+          - runner_name: catalina-4
+            label: 10.15
+            vm_name: catalina
+            node: macpro-6
+            port: 8825
+    steps:
+      - name: Install openconnect
+        run: brew install openconnect
+
+      - name: Checkout Orka API Client gem
+        uses: actions/checkout@v2
+        with:
+          repository: Homebrew/orka_api_client
+          path: orka_api_client
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.1"
+          bundler-cache: true
+          working-directory: orka_api_client
+
+      - name: Install Orka API Client gem
+        working-directory: orka_api_client
+        run: |
+          bundle exec rake
+          gem install pkg/orka_api_client-*.gem
+
+      - name: Wait for idle runner
+        id: killable
+        uses: Homebrew/actions/wait-for-idle-runner@master
+        with:
+          runner_name: ${{ matrix.runner_name }}
+          github_token: ${{ secrets.HOMEBREW_GITHUB_PUBLIC_REPO_TOKEN }}
+
+      - name: Connect to Orka VPN
+        if: ${{ steps.killable.outputs.runner-found == 'true' && steps.killable.outputs.runner-idle == 'true' }}
+        run: echo "${{ secrets.ORKA_VPN_PASSWORD }}" | openconnect "${{ secrets.ORKA_VPN_IP }}" --user="${{ secrets.ORKA_VPN_USER }}" --background --setuid=$(whoami) --servercert pin-sha256:vbaO8lPevDx8SUVMUy43VtttA+hL2RxYSjgXHd0Qey8=
+
+      - name: Kill runner and create a new one
+        if: ${{ steps.killable.outputs.runner-found == 'true' && steps.killable.outputs.runner-idle == 'true' }}
+        run: |
+          ruby -rorka_api_client -e '
+            client = OrkaAPI::Client.new("${{ secrets.ORKA_API_URL }}", token: "${{ secrets.ORKA_API_TOKEN }}")
+            resource = client.vm_resource("${{ matrix.vm_name }}")
+            instance = resource.instances.find do |instance|
+              instance.node.name == "${{ matrix.node }}" && instance.ssh_port == ${{ matrix.port }}
+            end
+
+            raise "Cannot find VM for ${{ matrix.runner_name }}!" if instance.nil?
+
+            instance.delete
+            resource.deploy(node: instance.node, vm_metadata: {
+              "registration_token" => "",
+              "runner_name" => "${{ matrix.runner_name }}",
+              "label" => "${{ matrix.label }}",
+            })
+          '
+
+      - name: Disonnect from Orka VPN
+        if: ${{ always() && steps.killable.outputs.runner-found == 'true' && steps.killable.outputs.runner-idle == 'true' }}
+        run: killall -SIGINT openconnect
